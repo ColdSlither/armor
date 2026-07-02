@@ -17,13 +17,13 @@ python3 serve.py         # http://127.0.0.1:9090
 
 ## What it does
 
-- **Work view** — type a task, watch the Editor→Verifier→Reviewer pipeline stream live
+- **Work view** — type a task, watch the Editor→Verifier→Reviewer pipeline stream live via SSE (Server-Sent Events)
 - **Chat view** — talk to Atlas through a browser (personality mode)
 - **Models view** — see available models, swap between 8B and 35B tiers
 
 ## Zero dependencies
 
-ARMOR uses Python's stdlib (`http.server`) + browser-native `fetch()`. No npm, no frameworks, no build step. One file, one port.
+ARMOR uses Python's stdlib (`http.server`) + browser-native `EventSource`. No npm, no frameworks, no build step. One file, one port.
 
 ## Architecture
 

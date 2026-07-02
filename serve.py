@@ -16,11 +16,12 @@ Usage:
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 from typing import Any
 
 
@@ -55,11 +56,46 @@ def _atlas(*args: str, timeout: int = 300, cwd: str | None = None) -> subprocess
     )
 
 
+def _atlas_stream(
+    *args: str,
+    timeout: int = 300,
+    cwd: str | None = None,
+    on_line: callable | None = None,
+) -> int:
+    """Run an Atlas CLI command, streaming stdout line by line via ``on_line`` callback.
+
+    Uses ``subprocess.Popen`` with line-buffered reading.  Each line (stripped of
+    trailing newline) is passed to ``on_line``.  Returns the process returncode.
+    Raises ``subprocess.TimeoutExpired`` on timeout.
+    """
+    cmd = [sys.executable, str(ATLAS_CLI)] if Path(ATLAS_CLI).is_file() else [ATLAS_CLI]
+    cmd.extend(args)
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,  # line-buffered
+        cwd=cwd or str(Path.cwd()),
+    )
+    try:
+        for line in iter(proc.stdout.readline, ""):
+            if on_line:
+                on_line(line.rstrip("\n\r"))
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        raise
+    return proc.returncode
+
+
 # ── MIME types ──
 
 MIME_JSON = "application/json"
 MIME_HTML = "text/html; charset=utf-8"
 MIME_STREAM = "application/x-ndjson"
+MIME_SSE = "text/event-stream"
 
 
 # ── ARMOR HTML — Cyberpunk / Odysseus-inspired ──
@@ -617,8 +653,8 @@ function setStep(spec, state) {
   if (el) el.className = 'pstep ' + state;
 }
 
-// ── Work pipeline ──
-async function runWork() {
+// ── Work pipeline (SSE streaming) ──
+function runWork() {
   const input = document.getElementById('work-input');
   const btn = document.getElementById('work-btn');
   const spec = input.value.trim();
@@ -627,54 +663,51 @@ async function runWork() {
   output.innerHTML = '';
   output.appendChild(buildPipelineBar());
   btn.disabled = true;
-  try {
-    const resp = await fetch(API + '/api/work', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({spec, max_rounds: 3})
-    });
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = '';
-    while (true) {
-      const {done, value} = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, {stream: true});
-      const lines = buf.split('\\n');
-      buf = lines.pop() || '';
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        try {
-          const ev = JSON.parse(line);
-          const div = document.createElement('div');
-          if (ev.event === 'result') {
-            div.className = 'dispatch ' + (ev.verdict || '');
-            setStep(ev.specialist, 'done');
-            const label = (ev.specialist || '').charAt(0).toUpperCase() + (ev.specialist || '').slice(1);
-            div.innerHTML = '<span class="rd">round ' + (ev.round || 1) + '</span> ' +
-              '<strong>' + label + '</strong> &mdash; <span class="verd">' + (ev.verdict || '?').toUpperCase() + '</span>';
-            if (ev.findings) {
-              const t = String(ev.findings);
-              div.innerHTML += '<div class="findings">' + escapeHtml(t.length > 120 ? t.slice(0,120) + '...' : t) + '</div>';
-            }
-          } else if (ev.event === 'complete') {
-            div.className = 'dispatch complete';
-            div.innerHTML = '<strong>pipeline ' + escapeHtml(ev.status || 'complete').toUpperCase() + '</strong>';
-          } else if (ev.event === 'error') {
-            div.className = 'dispatch error';
-            div.innerHTML = '<strong>ERROR</strong> ' + escapeHtml(ev.message || '');
-          } else if (ev.event === 'dispatch') {
-            setStep(ev.specialist, 'active');
-          }
-          if (div.innerHTML) output.appendChild(div);
-        } catch(e) {}
+
+  const evtSource = new EventSource(API + '/api/work?spec=' + encodeURIComponent(spec));
+
+  evtSource.onmessage = function(e) {
+    let ev;
+    try { ev = JSON.parse(e.data); } catch(_) { return; }
+    const div = document.createElement('div');
+    if (ev.event === 'result') {
+      div.className = 'dispatch ' + (ev.verdict || '');
+      setStep(ev.specialist, 'done');
+      const label = (ev.specialist || '').charAt(0).toUpperCase() + (ev.specialist || '').slice(1);
+      div.innerHTML = '<span class="rd">round ' + (ev.round || 1) + '</span> ' +
+        '<strong>' + label + '</strong> &mdash; <span class="verd">' + (ev.verdict || '?').toUpperCase() + '</span>';
+      if (ev.findings) {
+        const t = String(ev.findings);
+        div.innerHTML += '<div class="findings">' + escapeHtml(t.length > 120 ? t.slice(0,120) + '...' : t) + '</div>';
       }
+    } else if (ev.event === 'complete') {
+      div.className = 'dispatch complete';
+      div.innerHTML = '<strong>pipeline ' + escapeHtml(ev.status || 'complete').toUpperCase() + '</strong>';
+      evtSource.close();
+      btn.disabled = false;
+    } else if (ev.event === 'error') {
+      div.className = 'dispatch error';
+      div.innerHTML = '<strong>ERROR</strong> ' + escapeHtml(ev.message || '');
+      evtSource.close();
+      btn.disabled = false;
+    } else if (ev.event === 'dispatch') {
+      setStep(ev.specialist, 'active');
+      return;
+    } else {
+      return;
     }
+    if (div.innerHTML) output.appendChild(div);
     output.scrollTop = output.scrollHeight;
-  } catch(e) {
-    output.innerHTML = '<div class="dispatch error"><strong>NETWORK ERROR</strong> ' + escapeHtml(e.message) + '</div>';
-  }
-  btn.disabled = false;
+  };
+
+  evtSource.onerror = function() {
+    // Transport-level error — server closed the connection unexpectedly.
+    // If the button is still disabled, re-enable it so the user can retry.
+    if (btn.disabled) {
+      btn.disabled = false;
+    }
+    evtSource.close();
+  };
 }
 
 // ── Chat ──
@@ -838,6 +871,15 @@ class ArmorHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
 
+    def _sse(self, status: int = 200):
+        """Send SSE (Server-Sent Events) response headers."""
+        self.send_response(status)
+        self.send_header("Content-Type", MIME_SSE)
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+
     def _html(self):
         body = ARMOR_HTML.encode("utf-8")
         self.send_response(200)
@@ -867,14 +909,14 @@ class ArmorHandler(BaseHTTPRequestHandler):
             self._handle_status()
         elif path == "/api/models":
             self._handle_models()
+        elif path == "/api/work":
+            self._handle_work()
         else:
             self._html()
 
     def do_POST(self):
         path = urlparse(self.path).path.rstrip("/")
-        if path == "/api/work":
-            self._handle_work()
-        elif path == "/api/chat":
+        if path == "/api/chat":
             self._handle_chat()
         elif path == "/api/models/swap":
             self._handle_swap()
@@ -907,19 +949,38 @@ class ArmorHandler(BaseHTTPRequestHandler):
         self._json({"status": "ok" if ok else "error", "output": r.stdout.strip() or r.stderr.strip()})
 
     def _handle_work(self):
-        self._stream()
-        body = self._body()
-        spec = body.get("spec", "")
+        """Stream pipeline results via SSE (Server-Sent Events)."""
+        self._sse()
 
-        # Shell out to atlas work and relay events via stdout parsing.
-        # For now, just run it and return the result as a single event.
-        import time, os
-        result = _atlas("work", spec, timeout=300, cwd=os.getcwd())
-        if result.returncode == 0:
-            self.wfile.write(stream_event("complete", status="completed", output=result.stdout.strip()))
-        else:
-            self.wfile.write(stream_event("error", message=result.stderr.strip() or "pipeline failed"))
-        self.wfile.flush()
+        parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
+        spec = params.get("spec", [""])[0]
+
+        if not spec:
+            msg = json.dumps({"event": "error", "message": "missing spec query param"})
+            self.wfile.write(f"event: message\ndata: {msg}\n\n".encode())
+            self.wfile.flush()
+            return
+
+        def on_line(line: str):
+            """Relay each JSON line as an SSE event."""
+            if not line.strip():
+                return
+            try:
+                # Validate it's parseable JSON
+                json.loads(line)
+                self.wfile.write(b"event: message\n")
+                self.wfile.write(f"data: {line}\n\n".encode())
+                self.wfile.flush()
+            except json.JSONDecodeError:
+                pass  # skip non-JSON lines
+
+        try:
+            _atlas_stream("work", spec, timeout=300, cwd=os.getcwd(), on_line=on_line)
+        except subprocess.TimeoutExpired:
+            msg = json.dumps({"event": "error", "message": "pipeline timed out"})
+            self.wfile.write(f"event: message\ndata: {msg}\n\n".encode())
+            self.wfile.flush()
 
     def _handle_chat(self):
         self._stream()
