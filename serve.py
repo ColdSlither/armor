@@ -19,6 +19,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
@@ -76,8 +77,16 @@ def _atlas_stream(
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,  # line-buffered
+        env={**os.environ, "PYTHONUNBUFFERED": "1"},
         cwd=cwd or str(Path.cwd()),
     )
+    # Drain stderr on background thread to prevent deadlock
+    stderr_lines: list[str] = []
+    def _drain():
+        for line in iter(proc.stderr.readline, ""):
+            stderr_lines.append(line)
+    threading.Thread(target=_drain, daemon=True).start()
+
     try:
         for line in iter(proc.stdout.readline, ""):
             if on_line:
@@ -963,17 +972,18 @@ class ArmorHandler(BaseHTTPRequestHandler):
             return
 
         def on_line(line: str):
-            """Relay each JSON line as an SSE event."""
-            if not line.strip():
+            """Relay NDJSON events from atlas stdout as SSE."""
+            line = line.strip()
+            if not line:
                 return
             try:
-                # Validate it's parseable JSON
-                json.loads(line)
-                self.wfile.write(b"event: message\n")
-                self.wfile.write(f"data: {line}\n\n".encode())
-                self.wfile.flush()
+                data = json.loads(line)
+                if "event" in data:
+                    self.wfile.write(b"event: message\n")
+                    self.wfile.write(f"data: {line}\n\n".encode())
+                    self.wfile.flush()
             except json.JSONDecodeError:
-                pass  # skip non-JSON lines
+                pass  # not NDJSON
 
         try:
             _atlas_stream("work", spec, timeout=300, cwd=os.getcwd(), on_line=on_line)
