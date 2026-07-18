@@ -44,7 +44,7 @@ def stream_event(event: str, **fields: Any) -> bytes:
 
 # ── Atlas CLI wrapper ──
 
-def _atlas(*args: str, timeout: int = 300, cwd: str | None = None) -> subprocess.CompletedProcess:
+def _atlas(*args: str, timeout: int = 300, cwd: str | None = None, env: dict | None = None) -> subprocess.CompletedProcess:
     """Run an Atlas CLI command and return the result."""
     cmd = [sys.executable, str(ATLAS_CLI)] if Path(ATLAS_CLI).is_file() else [ATLAS_CLI]
     cmd.extend(args)
@@ -54,6 +54,7 @@ def _atlas(*args: str, timeout: int = 300, cwd: str | None = None) -> subprocess
         text=True,
         timeout=timeout,
         cwd=cwd or str(Path.cwd()),
+        env=env,
     )
 
 
@@ -505,6 +506,71 @@ ARMOR_HTML = r"""<!DOCTYPE html>
     color: var(--green);
     box-shadow: 0 0 6px rgba(34,197,94,0.08);
   }
+  .ms.llama {
+    background: rgba(0,229,255,0.08);
+    color: var(--teal);
+  }
+  .ms.kt {
+    background: rgba(255,140,0,0.10);
+    color: var(--amber);
+  }
+  /* Chat model picker + markdown polish */
+  .chat-toolbar {
+    display: flex;
+    gap: 0.4rem;
+    align-items: center;
+    padding: 0.3rem 0;
+    font-family: var(--font-ui);
+    font-size: 11px;
+    color: var(--fg-dim);
+  }
+  .chat-toolbar select {
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    color: var(--fg);
+    font: 11px var(--font-ui);
+    padding: 0.2rem 0.4rem;
+    border-radius: 3px;
+    outline: none;
+  }
+  .chat-toolbar select:focus { border-color: var(--teal); }
+  .chat-msg .content p { margin: 0.3rem 0; }
+  .chat-msg .content ul, .chat-msg .content ol { margin: 0.3rem 0 0.3rem 1.2rem; }
+  .chat-msg .content h1, .chat-msg .content h2, .chat-msg .content h3 {
+    font-family: var(--font-ui);
+    margin: 0.5rem 0 0.3rem;
+    color: var(--teal);
+  }
+  .chat-msg .content blockquote {
+    border-left: 2px solid var(--border);
+    padding-left: 0.6rem;
+    color: var(--fg-dim);
+    margin: 0.3rem 0;
+  }
+  .msg-copy {
+    float: right;
+    background: none;
+    border: 1px solid var(--border);
+    color: var(--fg-dim);
+    font: 9px var(--font-ui);
+    padding: 0.1rem 0.4rem;
+    border-radius: 3px;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.15s;
+  }
+  .chat-msg:hover .msg-copy { opacity: 1; }
+  .reasoning-block {
+    font-size: 11px;
+    color: var(--fg-dim);
+    border-left: 2px solid var(--border-dim);
+    padding-left: 0.5rem;
+    margin: 0.2rem 0 0.4rem;
+    max-height: 100px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+  }
+  .reasoning-block.collapsed { max-height: 18px; overflow: hidden; cursor: pointer; }
   .btn-swap {
     background: transparent;
     color: var(--teal);
@@ -585,6 +651,11 @@ ARMOR_HTML = r"""<!DOCTYPE html>
 </div>
 
 <div id="page-chat" class="page">
+  <div class="chat-toolbar">
+    <span>model:</span>
+    <select id="chat-model" onchange="loadChatModel()"></select>
+    <span id="chat-model-status" style="color:var(--fg-dim)"></span>
+  </div>
   <div id="chat-output">
     <div class="chat-msg assistant" style="animation:none">
       <div class="role">Atlas</div>
@@ -600,7 +671,7 @@ ARMOR_HTML = r"""<!DOCTYPE html>
 <div id="page-models" class="page">
   <div id="model-status">scanning...</div>
   <table id="model-table"><thead><tr>
-    <th>Model</th><th>Description</th><th>Size</th><th></th>
+    <th>Model</th><th>Backend</th><th>Mode</th><th>Score</th><th>Size</th><th></th>
   </tr></thead><tbody></tbody></table>
 </div>
 
@@ -642,7 +713,7 @@ function showPage(name) {
   page.style.transition = '';
   if (name === 'models') refreshModels();
   if (name === 'work') document.getElementById('work-input').focus();
-  if (name === 'chat') document.getElementById('chat-input').focus();
+  if (name === 'chat') { document.getElementById('chat-input').focus(); refreshChatModelPicker(); }
 }
 
 // ── Pipeline bar ──
@@ -720,14 +791,47 @@ function runWork() {
 }
 
 // ── Chat ──
+// Conversation history lives in the browser; posted to Atlas each turn.
+let chatHistory = [];
+
+// Tiny markdown renderer (no deps). Heads, code, bold, lists, blockquote.
+// Output is HTML; caller must have escapeHtml'd the input first via renderMd.
+function renderMd(src) {
+  // Escape first, then apply formatting (so model output can't inject HTML).
+  let s = escapeHtml(src);
+  // Code blocks ```...```
+  s = s.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) =>
+    '<pre><code>' + code.replace(/^\n/, '') + '</code></pre>');
+  // Inline code
+  s = s.replace(/`([^`]+)`/g, '<code>$1</code>');
+  // Headers
+  s = s.replace(/^### (.+)$/gm, '<h3>$1</h3>');
+  s = s.replace(/^## (.+)$/gm, '<h2>$1</h2>');
+  s = s.replace(/^# (.+)$/gm, '<h1>$1</h1>');
+  // Bold + italic
+  s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  s = s.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+  // Blockquote
+  s = s.replace(/^&gt; (.+)$/gm, '<blockquote>$1</blockquote>');
+  // Unordered list
+  s = s.replace(/^(\s*)[-*] (.+)$/gm, '<li>$2</li>');
+  s = s.replace(/(<li>[\s\S]*?<\/li>)/g, m => '<ul>' + m + '</ul>');
+  // Paragraphs (split on blank lines, skip block elements)
+  s = s.split(/\n\n+/).map(para => {
+    if (/^<(h\d|pre|ul|ol|blockquote|li)/.test(para.trim())) return para;
+    return '<p>' + para.replace(/\n/g, '<br>') + '</p>';
+  }).join('\n');
+  return s;
+}
+
 async function sendChat() {
   const input = document.getElementById('chat-input');
   const btn = document.getElementById('chat-btn');
   const msg = input.value.trim();
   if (!msg) return;
   const output = document.getElementById('chat-output');
-  const placeholder = output.querySelector('.placeholder');
-  if (placeholder) placeholder.remove();
+  const modelSel = document.getElementById('chat-model');
+  const targetModel = modelSel ? modelSel.value : '';
 
   const userDiv = document.createElement('div');
   userDiv.className = 'chat-msg user';
@@ -740,28 +844,31 @@ async function sendChat() {
   thinkDiv.className = 'thinking';
   thinkDiv.innerHTML = '<span>thinking</span><span class="td"></span><span class="td"></span><span class="td"></span>';
   output.appendChild(thinkDiv);
-  output.scrollTop = output.scrollHeight;
+  const atBottom = output.scrollHeight - output.scrollTop - output.clientHeight < 60;
+  if (atBottom) output.scrollTop = output.scrollHeight;
 
   const asstDiv = document.createElement('div');
   asstDiv.className = 'chat-msg assistant';
   asstDiv.style.display = 'none';
-  asstDiv.innerHTML = '<div class="role">Atlas</div><div class="content"></div>';
+  asstDiv.innerHTML = '<div class="role">Atlas</div><div class="reasoning-block collapsed" style="display:none" onclick="this.classList.toggle(\'collapsed\')"></div><div class="content"></div>';
+  const reasoningDiv = asstDiv.querySelector('.reasoning-block');
   const contentDiv = asstDiv.querySelector('.content');
+
+  // Snapshot history before this turn; sent to Atlas, and we append after.
+  const historyForAtlas = chatHistory.slice();
 
   try {
     const resp = await fetch(API + '/api/chat', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({message: msg})
+      body: JSON.stringify({message: msg, history: historyForAtlas, model: targetModel})
     });
     const reader = resp.body.getReader();
     const decoder = new TextDecoder();
     let buf = '';
-    let full = '';
-
-    thinkDiv.remove();
-    asstDiv.style.display = '';
-    output.appendChild(asstDiv);
+    let fullContent = '';
+    let fullReasoning = '';
+    let sawFirstToken = false;
 
     while (true) {
       const {done, value} = await reader.read();
@@ -773,19 +880,83 @@ async function sendChat() {
         if (!line.trim()) continue;
         try {
           const ev = JSON.parse(line);
-          if (ev.event === 'token') { full += ev.content; contentDiv.textContent = full; }
-          if (ev.event === 'done') { full = ev.content; contentDiv.textContent = full; }
+          if (!sawFirstToken && (ev.event === 'chat_token' || ev.event === 'chat_done')) {
+            sawFirstToken = true;
+            thinkDiv.remove();
+            asstDiv.style.display = '';
+            output.appendChild(asstDiv);
+          }
+          if (ev.event === 'chat_token') {
+            if (ev.kind === 'reasoning') {
+              fullReasoning += ev.content;
+              reasoningDiv.style.display = '';
+              reasoningDiv.textContent = fullReasoning;
+            } else {
+              fullContent += ev.content;
+              contentDiv.innerHTML = renderMd(fullContent);
+            }
+          } else if (ev.event === 'chat_done') {
+            if (ev.content) { fullContent = ev.content; contentDiv.innerHTML = renderMd(fullContent); }
+          } else if (ev.event === 'error') {
+            if (!sawFirstToken) { thinkDiv.remove(); asstDiv.style.display = ''; output.appendChild(asstDiv); sawFirstToken = true; }
+            contentDiv.innerHTML = '<span style="color:var(--red)">error: ' + escapeHtml(ev.message || '') + '</span>';
+          }
+          // Smart scroll: stick to bottom only if user was already there.
+          const ab = output.scrollHeight - output.scrollTop - output.clientHeight < 60;
+          if (ab) output.scrollTop = output.scrollHeight;
         } catch(e) {}
       }
     }
+    // Add copy button to the finished message.
+    if (fullContent) {
+      const copyBtn = document.createElement('button');
+      copyBtn.className = 'msg-copy';
+      copyBtn.textContent = 'copy';
+      copyBtn.onclick = () => { navigator.clipboard.writeText(fullContent); copyBtn.textContent = 'copied'; setTimeout(() => copyBtn.textContent = 'copy', 1200); };
+      asstDiv.appendChild(copyBtn);
+    }
+    // Update history for the next turn.
+    chatHistory.push({role: 'user', content: msg});
+    chatHistory.push({role: 'assistant', content: fullContent});
   } catch(e) {
     thinkDiv.remove();
     asstDiv.style.display = '';
     output.appendChild(asstDiv);
-    contentDiv.textContent = 'error: ' + e.message;
+    contentDiv.innerHTML = '<span style="color:var(--red)">error: ' + escapeHtml(e.message) + '</span>';
   }
-  output.scrollTop = output.scrollHeight;
+  if (atBottom) output.scrollTop = output.scrollHeight;
   btn.disabled = false;
+}
+
+// Populate the chat model picker from /api/models (loadable configs only).
+async function refreshChatModelPicker() {
+  const sel = document.getElementById('chat-model');
+  if (!sel) return;
+  try {
+    const resp = await fetch(API + '/api/models');
+    const data = await resp.json();
+    const loaded = data.loaded && data.loaded.loaded;
+    const configs = data.configs || [];
+    sel.innerHTML = '';
+    for (const c of configs) {
+      const opt = document.createElement('option');
+      opt.value = c.name;
+      opt.textContent = c.name + ' (' + c.backend + ')';
+      if (loaded && c.name === loaded) opt.selected = true;
+      sel.appendChild(opt);
+    }
+    const status = document.getElementById('chat-model-status');
+    if (status) {
+      status.textContent = loaded ? '→ ' + loaded + ' active' : '→ none loaded';
+    }
+  } catch(e) {}
+}
+function loadChatModel() {
+  // Model selection is informational until Atlas supports per-chat --model
+  // swapping without restarting the server. For now, show what's selected.
+  const sel = document.getElementById('chat-model');
+  const status = document.getElementById('chat-model-status');
+  if (sel && status) status.textContent = '→ ' + sel.value + ' selected';
 }
 
 // ── Models ──
@@ -793,32 +964,85 @@ async function refreshModels() {
   try {
     const resp = await fetch(API + '/api/models');
     const data = await resp.json();
-    const lines = (data.output || '').split('\\n').filter(Boolean);
     const statusEl = document.getElementById('model-status');
-    let loaded = '';
-    for (const line of lines) {
-      if (line.includes('*')) {
-        loaded = line.replace(/[*]/g, '').trim().split(/\\s+/)[0];
-      }
-    }
-    statusEl.innerHTML = loaded
-      ? 'active: <span class="ms loaded">' + escapeHtml(loaded) + '</span>'
-      : 'scanning models...';
     const tbody = document.querySelector('#model-table tbody');
     tbody.innerHTML = '';
-    // Each line: model_name  desc  size  [* if loaded]
-    for (const line of lines) {
-      const parts = line.trim().split(/\\s{2,}/);
-      const name = parts[0] || line.trim();
-      const isLoaded = loaded && name.includes(loaded);
+
+    // Loaded state from structured JSON (no more prose regex).
+    const loadedState = data.loaded || {};
+    const loadedName = loadedState.loaded;
+    const health = loadedState.health || 'down';
+    const hw = (data.tier && data.tier.hardware) || null;
+
+    let statusHtml = '';
+    if (loadedName) {
+      statusHtml = 'active: <span class="ms loaded">' + escapeHtml(loadedName) + '</span>';
+    } else if (loadedState.source === 'port_probe') {
+      statusHtml = '<span style="color:var(--amber)">server on port (unknown model)</span>';
+    } else {
+      statusHtml = '<span style="color:var(--fg-dim)">no model loaded</span>';
+    }
+    if (hw) {
+      statusHtml += ' <span style="color:var(--fg-dim);font-size:10px">| ' +
+        hw.vram_gb + 'GB VRAM, ' + (hw.kt_kernel ? 'kt-kernel ✓' : 'no kt-kernel') + '</span>';
+    }
+    statusEl.innerHTML = statusHtml;
+
+    // Configured (loadable now) models — from data.configs.
+    const configs = data.configs || [];
+    // Tier-analyzed models — from data.tier.models (may include kt-class entries
+    // that fit but can't be loaded yet because no ktransformers server exists).
+    const tierModels = (data.tier && data.tier.available && data.tier.models) || [];
+
+    // Render configured models first (these are the ones with working load buttons).
+    for (const cfg of configs) {
+      const isLoaded = loadedName && (cfg.name === loadedName || cfg.name === '8b' && loadedName === '8b');
       const tr = document.createElement('tr');
       tr.innerHTML =
-        '<td>' + escapeHtml(name) + '</td>' +
-        '<td style="color:var(--fg-dim);font-size:11px">' + escapeHtml(parts[1] || '-') + '</td>' +
-        '<td style="color:var(--fg-dim)">' + escapeHtml(parts[2] || '-') + '</td>' +
+        '<td><strong>' + escapeHtml(cfg.name) + '</strong>' +
+          '<div style="color:var(--fg-dim);font-size:10px">' + escapeHtml(cfg.description || '') + '</div></td>' +
+        '<td><span class="ms ' + (cfg.backend === 'ktransformers' ? 'kt' : 'llama') + '">' + escapeHtml(cfg.backend) + '</span></td>' +
+        '<td style="color:var(--fg-dim)">configured</td>' +
+        '<td style="color:var(--fg-dim)">—</td>' +
+        '<td style="color:var(--fg-dim)">' + (cfg.size_gb ? cfg.size_gb + ' GB' : '-') + '</td>' +
         '<td>' + (isLoaded
           ? '<span class="ms loaded">active</span>'
-          : '<button class="btn-swap" onclick="swapModel(\'' + escapeAttr(name) + '\')">load</button>') + '</td>';
+          : '<button class="btn-swap" onclick="swapModel(\'' + escapeAttr(cfg.name) + '\')">load</button>') + '</td>';
+      tbody.appendChild(tr);
+    }
+
+    // Then tier-analyzed models that AREN'T already in configs (the kt-class ones
+    // — what fits on this hardware via offload but needs a server we don't have).
+    const configNames = new Set(configs.map(c => c.name));
+    for (const m of tierModels) {
+      // Skip if already shown as a config, or if it doesn't fit.
+      if (configNames.has(m.name) || !m.fits) {
+        // Non-fitting models: show greyed with the reason.
+        if (!m.fits) {
+          const tr = document.createElement('tr');
+          tr.style.opacity = '0.4';
+          tr.innerHTML =
+            '<td>' + escapeHtml(m.name) + '</td>' +
+            '<td><span class="ms">—</span></td>' +
+            '<td colspan="3" style="color:var(--red);font-size:11px">' + escapeHtml(m.reason || 'does not fit') + '</td>' +
+            '<td></td>';
+          tbody.appendChild(tr);
+        }
+        continue;
+      }
+      // Fits but kt-class (server not available) — read-only with blocked reason.
+      const serverAvail = m.server_available !== false;
+      const tr = document.createElement('tr');
+      tr.innerHTML =
+        '<td>' + escapeHtml(m.name) +
+          (m.is_moe ? ' <span style="color:var(--fg-dim);font-size:10px">MoE</span>' : '') + '</td>' +
+        '<td><span class="ms ' + (m.backend === 'ktransformers' ? 'kt' : 'llama') + '">' + escapeHtml(m.backend) + '</span></td>' +
+        '<td style="color:var(--teal);font-size:11px">' + escapeHtml(m.mode || '') + '</td>' +
+        '<td>' + (m.score != null ? m.score.toFixed(0) : '—') + '</td>' +
+        '<td style="color:var(--fg-dim)">' + (m.weights_gb ? m.weights_gb + ' GB' : '-') + '</td>' +
+        '<td>' + (serverAvail
+          ? '<button class="btn-swap" onclick="swapModel(\'' + escapeAttr(m.name) + '\')">load</button>'
+          : '<span title="' + escapeAttr(m.load_blocked_reason || '') + '" style="color:var(--amber);font-size:10px;cursor:help">blocked</span>') + '</td>';
       tbody.appendChild(tr);
     }
   } catch(e) {
@@ -947,15 +1171,26 @@ class ArmorHandler(BaseHTTPRequestHandler):
         })
 
     def _handle_models(self):
-        r = _atlas("models", "list", timeout=10)
-        self._json({"output": r.stdout.strip()})
+        """Structured model list. Calls `atlas models list --json --tier-select`
+        and passes the structured blob through directly — no regex parsing.
 
-    def _handle_swap(self):
-        body = self._body()
-        name = body.get("name", "")
-        r = _atlas("models", "swap", name, timeout=480)
-        ok = r.returncode == 0
-        self._json({"status": "ok" if ok else "error", "output": r.stdout.strip() or r.stderr.strip()})
+        If the tier selector env var isn't set, degrades to configs-only JSON.
+        Atlas handles the selector-availability check and returns tier.available=False.
+        """
+        tier_selector = os.environ.get("ATLAS_TIER_SELECTOR_PATH", "")
+        args = ["models", "list", "--json"]
+        if tier_selector:
+            args.append("--tier-select")
+        env = {**os.environ, "ATLAS_TIER_SELECTOR_PATH": tier_selector} if tier_selector else None
+        r = _atlas(*args, timeout=30, env=env)
+        if r.returncode == 0 and r.stdout.strip():
+            try:
+                self._json(json.loads(r.stdout.strip()))
+                return
+            except json.JSONDecodeError:
+                pass  # fall through to error
+        self._json({"configs": [], "tier": {"available": False, "reason": "atlas models --json failed"},
+                    "loaded": {}, "error": r.stderr.strip()[:200] or r.stdout.strip()[:200]})
 
     def _handle_work(self):
         """Stream pipeline results via SSE (Server-Sent Events)."""
@@ -993,26 +1228,90 @@ class ArmorHandler(BaseHTTPRequestHandler):
             self.wfile.flush()
 
     def _handle_chat(self):
+        """Real chat: stream atlas chat --message --json NDJSON to the browser.
+
+        Contract:
+          POST body: {"message": str, "history": [{role, content}, ...]}
+          Response: application/x-ndjson stream of events:
+            {"event": "chat_token", "kind": "content"|"reasoning", "content": str}
+            {"event": "chat_done",  "content": str}     # full assembled answer
+            {"event": "error",      "message": str}     # on failure
+
+        History is written to a PID-named temp file (cleaned in finally) and
+        passed via --history so each request is stateless on Atlas's side —
+        ARMOR owns the conversation transcript in the browser.
+        """
         self._stream()
         body = self._body()
         message = body.get("message", "")
-        self.wfile.write(stream_event("done", content=f"[echo] {message}"))
-        self.wfile.flush()
+        history = body.get("history", [])
+
+        if not message:
+            self.wfile.write(stream_event("error", message="empty message"))
+            self.wfile.flush()
+            return
+
+        # Write history to a temp file. One file per request, cleaned in finally.
+        tmp_path = Path(f"/tmp/armor-chat-{os.getpid()}-{id(message)}.json")
+        try:
+            tmp_path.write_text(json.dumps(history))
+            cmd_args = ["chat", "--message", message, "--history", str(tmp_path), "--json"]
+
+            def on_line(line: str):
+                line = line.strip()
+                if not line:
+                    return
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    return  # not NDJSON (e.g. stderr noise that leaked through)
+                # Pass through Atlas's chat events verbatim. Atlas emits:
+                #   chat_token (kind=content|reasoning), chat_done.
+                # ARMOR's frontend already handles these shapes.
+                self.wfile.write((json.dumps(data) + "\n").encode("utf-8"))
+                self.wfile.flush()
+
+            try:
+                _atlas_stream(*cmd_args, timeout=180, on_line=on_line)
+            except subprocess.TimeoutExpired:
+                self.wfile.write(stream_event("error", message="chat timed out"))
+                self.wfile.flush()
+            except Exception as exc:
+                self.wfile.write(stream_event("error", message=f"chat failed: {exc}"))
+                self.wfile.flush()
+        finally:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 # ── CLI ──
 
 def main():
     import argparse
+    global ATLAS_CLI
     parser = argparse.ArgumentParser(description="ARMOR — Atlas GUI layer")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--bind", default="127.0.0.1", help="Bind address")
+    parser.add_argument("--atlas", default=ATLAS_CLI,
+                        help="Path to the Atlas CLI (agent.py) or 'atlas' if on PATH. "
+                             "e.g. ../atlas/agent.py")
+    parser.add_argument("--tier-selector", default=os.environ.get("ATLAS_TIER_SELECTOR_PATH", ""),
+                        help="Path to atlas_tier_selection.py (enables tier-aware Models view). "
+                             "e.g. ../intron-terminal-pipeline/atlas_tier_selection.py")
     args = parser.parse_args()
+
+    ATLAS_CLI = args.atlas
+    if args.tier_selector:
+        os.environ["ATLAS_TIER_SELECTOR_PATH"] = args.tier_selector
 
     server = HTTPServer((args.bind, args.port), ArmorHandler)
     print(f"ARMOR • http://{args.bind}:{args.port}")
-    print(f"Engine • github.com/ColdSlither/atlas")
+    print(f"Engine • {ATLAS_CLI}")
     print(f"Credit • Fork of pewdiepie-archdaemon/odysseus, inspired by pewdiepie")
+    if args.tier_selector:
+        print(f"Tier • {args.tier_selector}")
     print("Press Ctrl-C to stop.")
     try:
         server.serve_forever()
