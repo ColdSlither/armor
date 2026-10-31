@@ -32,7 +32,11 @@ from typing import Any
 # ── Config ──
 
 DEFAULT_PORT = 9092
-ATLAS_CLI = "/Users/terrellhenry/ZCodeProject/atlas-mac/agent.py"  # MAC VARIANT: points at the isolated Mac clone (branch `mac`)
+# The Atlas CLI is a sibling checkout, not a fixed location: resolve it next to this repo so the
+# path is not machine-specific, and let ATLAS_CLI override it for a different layout.
+ATLAS_CLI = os.environ.get("ATLAS_CLI") or str(
+    Path(__file__).resolve().parent.parent / "atlas-mac" / "agent.py"
+)
 
 
 # ── JSON helpers ──
